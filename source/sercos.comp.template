@@ -1,0 +1,337 @@
+component sercos "Real-time Sercos II component";
+pin in bit reset 		"Restart session (including syncronozong)";
+pin in unsigned ControlWord-#[#DRIVE_NUM#] "Sercos drive status word";
+
+#output_telegrams#
+pin out unsigned StatusWord-#[#DRIVE_NUM#] "Sercos drive status word";
+pin out unsigned error_count "Number of bad cycles since last syncronization";
+pin out unsigned error_per_sec "Number of bad cycles during last 1 second";
+pin out unsigned cycle_count "Number of sercos ii cycles modulo 2^32";
+pin out unsigned debug;
+pin out bit sync_done  "Sercos sync done flag";
+pin out bit rx_ok-#[#DRIVE_NUM#];
+#input_telegrams#
+
+param rw signed cycle_read_expected_shift =700 "kek";
+param r unsigned drive_at_watchdog 	=100 "How many mks i should wait for drive's anknowlenge telegramm before sending again"; 
+param rw unsigned verb =0 "verbosity";
+license "GPL"; // indicates GPL v2 or later
+option singleton yes;
+function _ nofp;
+option extra_setup yes;
+description """
+ Raw, untested and not accurate implementation of Sercos II protocol. 
+ Hovewer, it works. Please be careful using it.
+
+ How to use this module:
+ 
+	 1. You need a hardware device, connected to SERCOS II fiber ring. I used STM32F767ZI
+	 evaluation board. Unfortunately, i can not share it's code because of my contract 
+	 limitations, but it's pretty simple. This module sends messages which are ready to 
+	 be send to fiber, and hardware should operate this way every sercos cycle: 
+	 	* Request a message from this this module 
+	 	* Send a quick response after this request is satisfied
+	 	* Send feedback from drives to this module
+	You can contact me via Telegramm @arabel1a or via github for more information.
+
+	2. You need a captured syncronization stage from working sercos master. Sercos II 
+	is a proprietary protocol, and everyhing in this module was get by reverse-engineering.
+	I haven't enought time to explore it's service channel, so syncronization cycles are just
+	captured, analyzed, and synthezed intro messages. I used FC7501 pci card from bechoff 
+	and $10 logic analyzer for capturing. Analyzing and preparing script comes with this package.
+
+	3. You need to configure it for yourself manually 
+	....
+	//TODO//
+
+personality = drive number;
+
+""";
+;;
+
+#define MAX_RT_CYCLEN		#MAX_RT_CYCLEN#
+#define SYNC_FILE_NAME 		"#SYNC_FILE_NAME#"
+#define MAX_MESSAGE_SIZE 	#SERC_MAX_MESSAGE_SIZE#
+#define BUF_SIZE         	1024
+#define DRIVE_NUM  			#DRIVE_NUM#
+#define DEFAULT_IF          "#IFNAME#"
+
+int verbose = 0, shift=700;
+#include "../source/sercos-ethernet.h"
+#include "../source/sercos-mdt-gen.h"
+#include "../source/talk2stm.h"
+
+#include "../source/sercos-ethernet.c"
+#include "../source/sercos-mdt-gen.c"
+#include "../source/talk2stm.c"
+
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+#include <stdbool.h>
+
+bool restart = true;
+bool first_msg = true;
+
+SercosDrive drives[DRIVE_NUM];
+unsigned int error_counter = 0;
+
+const uint8_t STM_MAC[] 	= {#HW_MAC_0#, #HW_MAC_1#, #HW_MAC_2#, #HW_MAC_3#, #HW_MAC_4#, #HW_MAC_5#};
+const uint8_t PC_MAC[] 		= {#EMC_MAC_0#, #EMC_MAC_1#, #EMC_MAC_2#, #EMC_MAC_3#, #EMC_MAC_4#, #EMC_MAC_5#};
+
+int verdict = 0;
+uint8_t eth_tx_buf[BUF_SIZE];
+uint8_t eth_rx_buf[BUF_SIZE];
+int eth_rx_len, eth_tx_len = 0;
+long long eth_total_recieved = 0;
+long long eth_total_send     = 0;
+bool internal_reset = false;
+int error_per_sec_temp 	= 0;
+int timeshift = 0;
+
+/*	init() for sercos 				*/
+EXTRA_SETUP(){
+   	printf("Sercos II session : start\n");	
+   	/* initializing variables, open files, etc*/
+ 	first_msg = true;
+ 	if(verbose > 0) sercos_eth_deinit();
+ 	error_counter = 0;		
+ 	verdict = 0;
+ 	eth_rx_len, eth_tx_len = 0;
+ 	eth_total_recieved 	= 0;
+ 	eth_total_send    	= 0;
+ 	//error_count 		= 0;
+	error_per_sec_temp 	= 0;
+ 	/* initializing  drives. TODO : read config from file */
+ 	
+ 	/* drive configs here (auto-generated)*/ 	
+	#drives#
+
+
+ 	/*		initializing stm32 talker	     */
+ 	FILE * f = fopen(SYNC_FILE_NAME,"rb");
+ 	stm_talker_init(f);
+ 	sercos_eth_init(eth_tx_buf, STM_MAC, PC_MAC);
+ 	fclose(f);
+ 	if(verbose > 0) printf("Sercos init done\n");
+ 	return(0);
+
+}
+
+
+/*		Microseconds since watchdog				*/
+unsigned long long get_tim(unsigned long long watchdog){
+	unsigned long long newtime = rtapi_get_time();
+	long long ttttim = abs(newtime - watchdog);
+	ttttim = ttttim > 500000000 ? 1000000000  - ttttim : ttttim;
+	return ttttim / 1000;
+}
+
+
+
+
+/*		Correct limnuxcnc thread to achieve synxronization with sercos				*/
+long long readtime_buff[] = {0,0,0,0,0,0,0,0,0,0};
+long long sum_readtime, readtime_buff_pos=0;
+bool readtime_buff_filled = false;
+void update_readtime(long long time){
+	sum_readtime += time - readtime_buff[readtime_buff_pos];
+	readtime_buff[readtime_buff_pos] = time;
+
+	if(++readtime_buff_pos > 9) {
+		readtime_buff_pos = 0;
+		readtime_buff_filled = true;
+	}
+
+	if(readtime_buff_filled)
+		rtapi_task_pll_set_correction(10 * (sum_readtime - 10*shift));
+}
+
+
+
+FUNCTION(_)
+{
+	shift=cycle_read_expected_shift;
+	verbose=verb;
+
+	if(reset || internal_reset){
+		stm_talker_reset();
+		internal_reset 	= false;
+		sync_done 		= false;
+		error_count 	= 0;
+		error_counter 	= 0;
+		error_per_sec_temp = 0;
+		return;
+	}
+
+	unsigned long long cycle_start = rtapi_get_time();
+	unsigned long long at = 0;
+	bool wait_for_AT = false;
+	int	resends = 0;
+	bool got_rq = false;
+	bool got_fb = false;
+	bool got_at = false;
+	verdict = 0;
+
+	/* read hal pins			*/
+	for(int i = 0; i < DRIVE_NUM; i++)
+	{
+		drives[i].rx_ok = false;
+		drives[i].ControlWord = ControlWord(i);
+	}
+	/*	autogenerated part			*/
+	#out_pins#
+	while(1){
+		usleep(20);
+		if(got_rq && got_fb && got_at)// && get_tim(cycle_start) > 2 * drive_at_watchdog) 
+			break;
+
+		/*     10 bad packages in a row = resync	*/
+		if(error_counter > 10){
+			sync_done = false;
+			if(verbose > 0) 
+				rtapi_print("Error: >10 bad SERCOS II packages in a row, restarting. \n");
+			internal_reset = true;
+			break;
+		}
+		if(cycle_count > 6000 && (cycle_count / 100) <= error_counter){
+			sync_done = false;
+			if(verbose > 0) 
+				rtapi_print("Error: 1% of cycles are corrupted. \n");
+			internal_reset = true;
+			break;
+		}
+
+		if(eth_total_send % 5000 == 0){
+			error_per_sec 	= error_per_sec_temp;
+			error_per_sec_temp = 0;
+		}
+
+
+		/*		check watchdogs			*/
+		if( get_tim(cycle_start) > MAX_RT_CYCLEN ){		
+			if(SERCOS_SYNC_DONE){
+				if(!got_rq){
+					if(verbose > 0) rtapi_print("warning: no request this cycle 	\n");
+					error_per_sec_temp ++;
+					error_count ++;
+				}
+				if(!got_fb){
+					if(verbose > 0) rtapi_print("warning: no feedback this cycle. \n");
+					error_per_sec_temp ++;
+					error_count ++;
+				}
+				if(!got_at){
+					if(verbose > 0) rtapi_print("warning: no AT this cycle \n");
+					error_per_sec_temp ++;
+					error_count ++;
+				}
+				error_counter++;
+			}
+			break;
+		}
+
+		/*		drive's quick anknowledge telegramm. If in didn't arrived in some time, try to resend */
+		if( wait_for_AT && get_tim(at) > drive_at_watchdog && resends < 3 ){
+			/*		TODO		*/
+			resends += 1;
+			at=rtapi_get_time();
+			sercos_eth_send(eth_tx_buf, eth_tx_len);
+		}
+
+
+		eth_rx_len = sercos_eth_receive( eth_rx_buf, BUF_SIZE );
+
+		if(0 >= eth_rx_len ){
+		    continue;
+		}
+
+		verdict = analysis(DRIVE_NUM, drives, eth_rx_buf, eth_rx_len, eth_tx_buf, eth_tx_len, eth_total_send, eth_total_recieved);
+
+		
+		if( verdict == RESTART ){
+			if(verbose > 0) rtapi_print("Stm requested restart. Good Bye <3\n");
+			internal_reset = true;
+			return;
+		}
+
+
+		if( verdict == PASS || verdict== TIMESTAMP){
+			/* do nothing	*/
+			continue;
+		}
+
+		if( verdict == CRC_MISMATCH){
+			/*	 send prevous telegramm again	*/
+			at = rtapi_get_time();
+			sercos_eth_send(eth_tx_buf, eth_tx_len);
+		}
+
+		if(verdict ==  AT) {
+			/*	 drive's achieved my telegramm */
+			wait_for_AT = false;
+			got_at = true;
+			continue;
+		}
+
+		if( verdict == UNKNOWN || verdict == CORRUPTED || verdict == MISS_TG){
+			error_counter++;
+			error_per_sec_temp ++;
+			error_count ++;
+			if(verdict != MISS_TG) continue;
+		}
+
+		
+
+		/*		Get the fedback		*/		
+		if(verdict == OK || verdict == MISS_TG)
+		{	if(verdict == OK) error_counter = 0;
+			if(sercos_sync_stage > 33) update_readtime(get_tim(cycle_start));
+			got_fb = true;
+			continue;
+		}
+
+
+		/*		send the command			*/
+		if(verdict == REQUEST){
+			first_msg = false;		
+			/*   preparing the answer   */
+			eth_tx_len = synthesis(DRIVE_NUM, drives, eth_tx_buf, eth_total_send); 
+
+			/*   sending  prepared message  */
+			verdict = 0;
+			eth_total_send ++;
+			resends = 0;
+			// printf("im here \n");
+			sercos_eth_send(eth_tx_buf, eth_tx_len);
+			at = rtapi_get_time();
+			got_rq = true;
+		}
+	}
+	for(int i = 0; i < DRIVE_NUM; i++)
+	{
+		rx_ok(i) = drives[i].rx_ok;
+		StatusWord(i) = drives[i].StatusWord;
+	}
+	#in_pins#
+
+
+	cycle_count = eth_total_send;
+	debug = timestamp_response;
+	if(sync_done &&  cycle_count - debug != timeshift)
+	{
+		rtapi_print("warning: stm and my cyc count mismatches!\n");
+		timeshift = cycle_count - debug;
+	}
+	if(SERCOS_SYNC_DONE && ! SERCOS_SYNC_DONE_prev)
+		sync_done 	= true;
+	SERCOS_SYNC_DONE_prev = SERCOS_SYNC_DONE;
+	return;		
+}
+	
+
+
+

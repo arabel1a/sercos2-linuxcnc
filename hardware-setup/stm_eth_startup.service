@@ -1,0 +1,9 @@
+[Unit]
+Description=Configure ethernet 4 sercos stm
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/stm.sh
+
+[Install]
+WantedBy=multi-user.target
