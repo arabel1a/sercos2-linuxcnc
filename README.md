@@ -1,5 +1,5 @@
 ## Motivation
-The SERCOS II fiber optics protocol was popular a couple of decades ago, but now modern devices use SERCOS III based on Ethernet. Some older machines (in my case, Trumph TC2000R) are economically inefficient to repair, the new CNC unit cost>$10k. This is why I implemented SERCOS II for myself, leveraging simple and free LinuxCNC with self-made hardware for $500 all.
+The SERCOS II fiber optics protocol was popular a couple of decades ago, but now modern devices use SERCOS III based on Ethernet. Some older machines (in my case, Trumph TC2000R) are economically inefficient to repair, the new CNC unit cost>$10k. This is why I implemented SERCOS II for myself, leveraging simple and free LinuxCNC, consumer-scale network device with self-made hardware for $500 all.
 
 ## Legal status
 It is **not** an end-to-end software for operation with SERCOS II. You **can not** clone this project and get your drives to work with LinuxCNC. 
